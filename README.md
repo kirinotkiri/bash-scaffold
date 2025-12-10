@@ -1,4 +1,5 @@
-bash-scaffold
+#bash-scaffold
+
 A niche, partially vibe-coded bash script that acts as a simpler iterative deployment scripting tool. It trades complex capabilities for ease of use and zero dependencies.
 Made for my own use case, feel free to add, fork, or do whatever.
 
