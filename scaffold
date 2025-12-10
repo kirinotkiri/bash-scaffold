@@ -1,0 +1,510 @@
+#!/bin/bash
+
+# SCAFFOLD - Programmable Deployment Engine
+# Version: 3.1 (Restored Detailed Help)
+
+MANIFEST=".scmanif"
+DEFAULT_RULE_FILE="SCAFFOLD"
+LOG_PREFIX="\033[1;34m[SCAFFOLD]\033[0m"
+ERR_PREFIX="\033[1;31m[ERROR]\033[0m"
+VERBOSE=false
+DEBUG_MODE=false
+
+# Global associative arrays
+declare -A FILES
+declare -A VARS
+
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+log() { echo -e "${LOG_PREFIX} $(date '+%H:%M:%S') > $1"; }
+vlog() { if [ "$VERBOSE" = true ]; then echo -e "${LOG_PREFIX} [DEBUG] $1"; fi; }
+error() { echo -e "${ERR_PREFIX} $1"; exit 1; }
+
+usage() {
+    echo -e "${LOG_PREFIX} \033[1;37mSCAFFOLD v3.1\033[0m - Programmable Deployment Engine"
+    echo "Usage: scaffold <command> [flags]"
+    echo ""
+    echo -e "\033[1;33mCore Commands:\033[0m"
+    echo "  init         Initialize a directory for deployment tracking."
+    echo "  iterate      Deploy a new version (Download -> Iterate -> Down -> Up)."
+    echo "               Flags: --git <url>, --zip <path>, --folder <path>"
+    echo "                      --release (+1.0.0), --version (+0.1.0), --minor (+0.0.1)"
+    echo "                      --verbose, --debug"
+    echo "  list         Show the version history tree."
+    echo "               Flags: --rv <X> (Filter by Release), --vv <Y> (Filter by Version)"
+    echo "  current      Show the currently active version."
+    echo ""
+    echo -e "\033[1;33mManagement Commands:\033[0m"
+    echo "  up           Switch to a specific version (Down current -> Up target)."
+    echo "               Flags: --rv <X> --vv <Y> --mv <Z>"
+    echo "  down         Stop the currently active deployment."
+    echo "  proc         Manually run a procedure defined in the SCAFFOLD file."
+    echo "               Usage: scaffold proc <NAME> [--file <path>]"
+    echo "  scaffold     Debug tool: prints the final resolved rule file."
+    echo ""
+    echo -e "\033[1;33mVariable Overrides:\033[0m"
+    echo "  You can override any variable defined in your SCAFFOLD file by passing"
+    echo "  --v<Name> \"<Value>\" to any command."
+    echo "  Example: scaffold iterate --minor --vapp_port \"8080\""
+    echo ""
+    exit 1
+}
+
+get_manif_var() { grep "^$1=" "$MANIFEST" | cut -d'=' -f2; }
+set_manif_var() {
+    local key="$1"; local val="$2"
+    if grep -q "^$key=" "$MANIFEST"; then
+        sed -i.bak "s|^$key=.*|$key=$val|" "$MANIFEST" && rm "$MANIFEST.bak"
+    else
+        echo "$key=$val" >> "$MANIFEST"
+    fi
+}
+
+add_version_record() { if ! grep -q "^VER|$1|" "$MANIFEST"; then echo "VER|$1|$2" >> "$MANIFEST"; fi; }
+get_version_path() { grep "^VER|$1|" "$MANIFEST" | cut -d'|' -f3; }
+
+# -----------------------------------------------------------------------------
+# PARSING ENGINE
+# -----------------------------------------------------------------------------
+compact_rules() {
+    local file="$1"
+    if [ ! -f "$file" ]; then error "File not found: $file"; fi
+    local dir=$(dirname "$file")
+    while IFS= read -r line || [ -n "$line" ]; do
+        local clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//;s/\r//g')
+        if [[ "$clean_line" =~ ^INCLUDE[[:space:]]+(.*)$ ]]; then
+            local inc_file="${BASH_REMATCH[1]}"
+            if [[ "$inc_file" != /* ]]; then inc_file="$dir/$inc_file"; fi
+            vlog "Including $inc_file"
+            compact_rules "$inc_file"
+        else
+            echo "$clean_line"
+        fi
+    done < "$file"
+}
+
+load_context() {
+    local rule_content="$1"
+    FILES=()
+    # Note: We do NOT clear VARS here, because CLI overrides might have populated it already
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ ]] && continue
+        [[ -z "$line" ]] && continue
+        
+        read -r cmd name val <<< "$line"
+        
+        if [ "$cmd" == "FILE" ]; then
+            FILES[$name]="$val"
+            vlog "Loaded FILE: $name -> $val"
+        elif [ "$cmd" == "VARIABLE" ]; then
+            local raw_val=$(echo "$line" | cut -d' ' -f3-)
+            if [[ "$raw_val" =~ ^\"(.*)\"$ ]]; then raw_val="${BASH_REMATCH[1]}"; fi
+            
+            # CLI Override Protection: Only set if empty
+            if [ -z "${VARS[$name]}" ]; then
+                VARS[$name]="$raw_val"
+                vlog "Loaded VARIABLE: $name -> $raw_val"
+            else
+                vlog "Variable $name preserved (Override): ${VARS[$name]}"
+            fi
+        fi
+    done <<< "$rule_content"
+}
+
+expand_vars() {
+    local text="$1"
+    for key in "${!VARS[@]}"; do
+        text="${text//%$key%/${VARS[$key]}}"
+    done
+    echo "$text"
+}
+
+# -----------------------------------------------------------------------------
+# EXECUTION ENGINE
+# -----------------------------------------------------------------------------
+execute_procedure() {
+    local proc_name="$1"
+    local rule_content="$2"
+    local context_dir="$3"
+    
+    log "Procedure: $proc_name"
+    local inside_proc=false
+    local found_proc=false
+
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//;s/\r//g')
+        [[ "$line" =~ ^#.*$ ]] && continue
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" == "PROCEDURE $proc_name BEGIN" ]]; then
+            inside_proc=true; found_proc=true; continue
+        fi
+        if [[ "$line" == "PROCEDURE $proc_name END" ]]; then
+            inside_proc=false; break
+        fi
+
+        if [ "$inside_proc" = true ]; then
+            local expanded_line=$(expand_vars "$line")
+            process_instruction "$expanded_line" "$context_dir"
+        fi
+    done <<< "$rule_content"
+
+    if [ "$found_proc" = false ]; then error "Procedure '$proc_name' not found."; fi
+}
+
+process_instruction() {
+    local line="$1"
+    local ctx="$2"
+    read -r p1 p2 p3 rest <<< "$line"
+
+    if [ "$p1" == "SCAFFOLD" ]; then
+        case $p2 in
+            FILE) handle_file_op "$p3" "$rest" "$ctx" ;;
+            ALTER) handle_alter_op "$p3" "$rest" "$ctx" ;;
+            BASH)
+                if [[ "$line" =~ SCAFFOLD[[:space:]]+BASH[[:space:]]+\"(.+)\"[[:space:]]+AT[[:space:]]+(.*) ]]; then
+                    local cmd="${BASH_REMATCH[1]}"
+                    local dir="${BASH_REMATCH[2]}"
+                    # Smart Variable Check
+                    if [ -n "${VARS[$dir]}" ]; then dir="${VARS[$dir]}"; fi
+                    handle_bash_op "$cmd" "$dir" "$ctx"
+                else
+                    error "Invalid BASH syntax. Use: SCAFFOLD BASH \"cmd\" AT <dir>"
+                fi
+                ;;
+            PROC) execute_procedure "$p3" "$GLOBAL_RULES" "$ctx" ;;
+        esac
+    fi
+}
+
+handle_file_op() {
+    local action="$1"; local args="$2"; local root="$3"
+    local tag=$(echo "$args" | awk '{print $1}')
+    local dest=$(echo "$args" | awk '{print $2}')
+    local remainder=$(echo "$args" | cut -d' ' -f3-)
+    
+    local src="${FILES[$tag]}"
+    if [ -z "$src" ]; then error "FILE tag '$tag' not defined."; fi
+    local target_name=$(basename "$src")
+    if [[ "$remainder" == *"--AS"* ]]; then target_name=$(echo "$remainder" | awk -F'--AS ' '{print $2}' | awk '{print $1}'); fi
+
+    if [ "$action" == "PLACE" ]; then
+        vlog "Copying $tag -> $dest/$target_name"
+        cp -r "$src" "$root/$dest/$target_name"
+    elif [ "$action" == "TARGET" ]; then
+        vlog "Linking $tag -> $dest/$target_name"
+        ln -sf "$(realpath $src)" "$root/$dest/$target_name"
+    fi
+}
+
+handle_alter_op() {
+    local action="$1"; local args="$2"; local root="$3"
+    local tag=$(echo "$args" | awk '{print $1}')
+    local target=$(echo "$args" | awk '{print $2}')
+    local val_at=$(echo "$args" | awk -F'--at ' '{print $2}' | awk -F' --end' '{print $1}' | sed 's/^[ \t]*//;s/[ \t]*$//')
+    local val_end=$(echo "$args" | awk -F'--end ' '{print $2}' | sed 's/^[ \t]*//;s/[ \t]*$//')
+
+    local content=""
+    if [ -n "${VARS[$tag]}" ]; then content="${VARS[$tag]}"; elif [ -n "${FILES[$tag]}" ]; then if [ -f "${FILES[$tag]}" ]; then content=$(cat "${FILES[$tag]}"); fi; else error "Tag '$tag' not found."; fi
+    local target_file="$root/$target"
+    if [ ! -f "$target_file" ]; then error "Target file $target not found."; fi
+
+    export SCAFF_CONTENT="$content"
+    export SCAFF_AT="$val_at"
+    export SCAFF_END="$val_end"
+
+    if [[ "$val_at" =~ ^[0-9]+$ ]]; then
+        if [ "$action" == "INJECT" ]; then perl -i -pe 'print $ENV{SCAFF_CONTENT}."\n" if $. == $ENV{SCAFF_AT}' "$target_file"
+        elif [ "$action" == "INPLACE" ]; then perl -i -pe 'if ($. >= $ENV{SCAFF_AT} && $. <= $ENV{SCAFF_END}) { $_ = ($. == $ENV{SCAFF_AT} ? $ENV{SCAFF_CONTENT}."\n" : ""); }' "$target_file"; fi
+    else
+        if [ "$action" == "INJECT" ]; then perl -i -pe 's/\Q$ENV{SCAFF_AT}\E/$ENV{SCAFF_CONTENT}/g' "$target_file"
+        elif [ "$action" == "INPLACE" ]; then perl -0777 -i -pe 's/\Q$ENV{SCAFF_AT}\E.*?\Q$ENV{SCAFF_END}\E/$ENV{SCAFF_CONTENT}/gs' "$target_file"; fi
+    fi
+    unset SCAFF_CONTENT SCAFF_AT SCAFF_END
+}
+
+handle_bash_op() {
+    local cmd="$1"; local rel_dir="$2"; local root="$3"
+    local target_dir="$root/$rel_dir"
+    if [ ! -d "$target_dir" ]; then error "Directory $target_dir ($root/$rel_dir) does not exist."; fi
+    log "Exec BASH in ($rel_dir): $cmd"
+    (cd "$target_dir" && eval "$cmd") || error "Bash command failed."
+}
+
+# -----------------------------------------------------------------------------
+# COMMANDS
+# -----------------------------------------------------------------------------
+
+cmd_init() {
+    if [ -f "$MANIFEST" ]; then error "Manifest exists."; fi
+    touch "$MANIFEST"
+    set_manif_var "LATEST_VERSION" "0.0.0"
+    set_manif_var "CURRENT_DEPLOYMENT" "NONE"
+    if [ ! -f "$DEFAULT_RULE_FILE" ]; then
+        cat <<EOF > "$DEFAULT_RULE_FILE"
+# SCAFFOLD 3.1 Configuration
+VARIABLE app_port "3000"
+VARIABLE deploy_path "."
+SCAFFOLD BASE GIT https://github.com/user/repo.git
+PROCEDURE ITERATE BEGIN
+    # SCAFFOLD BASH "echo 'Deploying to port %app_port%'" AT deploy_path
+PROCEDURE ITERATE END
+PROCEDURE UP BEGIN
+    # SCAFFOLD BASH "docker compose up -d --build" AT deploy_path
+PROCEDURE UP END
+PROCEDURE DOWN BEGIN
+    # SCAFFOLD BASH "docker compose down" AT deploy_path
+PROCEDURE DOWN END
+EOF
+        log "Initialized $DEFAULT_RULE_FILE"
+    fi
+    log "Ready."
+}
+
+cmd_compactrule() {
+    local target="$DEFAULT_RULE_FILE"
+    # CLI overrides for vars must be parsed FIRST
+    VARS=()
+    FILES=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --file) target="$2"; shift 2 ;;
+            --v*) local key=${1#--v}; local val="$2"; VARS[$key]="$val"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    GLOBAL_RULES=$(compact_rules "$target")
+    load_context "$GLOBAL_RULES"
+    
+    echo "$GLOBAL_RULES" | while IFS= read -r line; do
+        # 1. Rewrite VARIABLE lines to show active state
+        if [[ "$line" =~ ^VARIABLE[[:space:]]+([^[:space:]]+) ]]; then
+            local var_name="${BASH_REMATCH[1]}"
+            if [ -n "${VARS[$var_name]}" ]; then
+                echo "VARIABLE $var_name \"${VARS[$var_name]}\" # (Active)"
+                continue
+            fi
+        fi
+
+        # 2. Expand %VAR%
+        local exp_line=$(expand_vars "$line")
+
+        # 3. Add hints for AT <VAR> usage
+        if [[ "$exp_line" =~ AT[[:space:]]+([^[:space:]]+)$ ]]; then
+             local possible_var="${BASH_REMATCH[1]}"
+             if [ -n "${VARS[$possible_var]}" ]; then
+                 echo "$exp_line # (Resolves to: ${VARS[$possible_var]})"
+                 continue
+             fi
+        fi
+
+        echo "$exp_line"
+    done
+}
+
+cmd_list() {
+    if [ ! -f "$MANIFEST" ]; then error "No manifest found."; fi
+    local filter_rv=""; local filter_vv=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --rv) filter_rv="$2"; shift 2 ;;
+            --vv) filter_vv="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    local current=$(get_manif_var "CURRENT_DEPLOYMENT")
+    echo -e "${LOG_PREFIX} Version Tree"
+    if [ -n "$filter_rv" ]; then echo "Scope: Release $filter_rv"; fi
+    grep "^VER|" "$MANIFEST" | cut -d'|' -f2 | sort -V | while read ver; do
+        IFS='.' read -r r v m <<< "$ver"
+        if [ -n "$filter_rv" ] && [ "$r" != "$filter_rv" ]; then continue; fi
+        if [ -n "$filter_vv" ] && [ "$v" != "$filter_vv" ]; then continue; fi
+        if [ "$r" != "$last_r" ]; then echo -e "\033[1;36mRelease $r.x.x\033[0m"; last_r=$r; last_v=""; fi
+        if [ "$v" != "$last_v" ]; then echo -e "├── \033[1;35mVersion $r.$v.x\033[0m"; last_v=$v; fi
+        prefix="│   └──"
+        status=""; if [ "$ver" == "$current" ]; then status=" \033[1;32m(ACTIVE)\033[0m"; fi
+        echo -e "$prefix $ver$status"
+    done
+}
+
+cmd_iterate() {
+    if [ ! -f "$MANIFEST" ]; then error "Not initialized."; fi
+    local zip_src=""; local git_src=""; local folder_src=""; local mode="" 
+    local rule_file="$DEFAULT_RULE_FILE"
+    local arg_rv=""; local arg_vv=""; local arg_mv=""
+    VARS=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --zip) zip_src="$2"; shift 2 ;;
+            --git) git_src="$2"; shift 2 ;;
+            --folder) folder_src="$2"; shift 2 ;;
+            --file) rule_file="$2"; shift 2 ;;
+            --release) mode="release"; shift ;;
+            --version) mode="version"; shift ;;
+            --minor) mode="minor"; shift ;;
+            --verbose) VERBOSE=true; shift ;;
+            --debug) DEBUG_MODE=true; VERBOSE=true; set -x; shift ;;
+            --rv) arg_rv="$2"; shift 2 ;;
+            --vv) arg_vv="$2"; shift 2 ;;
+            --mv) arg_mv="$2"; shift 2 ;;
+            --v*) local key=${1#--v}; local val="$2"; VARS[$key]="$val"; shift 2 ;;
+            *) error "Unknown argument: $1" ;;
+        esac
+    done
+
+    if [ ! -f "$rule_file" ]; then error "Rule file $rule_file not found."; fi
+    GLOBAL_RULES=$(compact_rules "$rule_file")
+    load_context "$GLOBAL_RULES"
+
+    local inputs=0
+    if [ -n "$zip_src" ]; then ((inputs++)); fi
+    if [ -n "$git_src" ]; then ((inputs++)); fi
+    if [ -n "$folder_src" ]; then ((inputs++)); fi
+
+    if [ $inputs -eq 0 ]; then
+        local base_line=$(echo "$GLOBAL_RULES" | grep "^SCAFFOLD BASE" | head -n 1)
+        if [ -n "$base_line" ]; then
+            read -r _ _ type val <<< "$base_line"
+            case $type in GIT) git_src="$val";; ZIP) zip_src="$val";; FOLDER) folder_src="$val";; esac
+            log "Using Base from File: $type $val"
+        else
+             error "No Source provided (CLI or File)."
+        fi
+    fi
+
+    local old_ver=$(get_manif_var "LATEST_VERSION")
+    IFS='.' read -r o_rv o_vv o_mv <<< "$old_ver"
+    o_rv=${o_rv:-0}; o_vv=${o_vv:-0}; o_mv=${o_mv:-0}
+    local n_rv=$o_rv; local n_vv=$o_vv; local n_mv=$o_mv
+    if [ -n "$arg_rv" ]; then n_rv=$arg_rv; fi
+    if [ -n "$arg_vv" ]; then n_vv=$arg_vv; fi
+    if [ -n "$arg_mv" ]; then n_mv=$arg_mv; fi
+    if [ "$mode" == "release" ]; then ((n_rv++)); n_vv=0; n_mv=0; fi
+    if [ "$mode" == "version" ]; then ((n_vv++)); n_mv=0; fi
+    if [ "$mode" == "minor" ];   then ((n_mv++)); fi
+    local new_ver="${n_rv}.${n_vv}.${n_mv}"
+    
+    if [ -d "versions/$new_ver" ]; then
+        echo -e "${LOG_PREFIX} \033[1;33mVersion $new_ver exists.\033[0m"
+        read -p "Replace it? [y/N] " confirm
+        if [[ "$confirm" == "y" ]] || [[ "$confirm" == "Y" ]]; then rm -rf "versions/$new_ver"; else error "Aborted."; fi
+    fi
+    
+    log "Iterating $old_ver -> $new_ver"
+    local work_dir="versions/$new_ver"
+    mkdir -p "$work_dir/source"
+    local source_root="$work_dir/source"
+
+    trap 'log "Failure. Cleaning up $work_dir..."; rm -rf "$work_dir"' EXIT
+
+    if [ -n "$git_src" ]; then rmdir "$source_root"; git clone "$git_src" "$source_root" --quiet || error "Git failed."; fi
+    if [ -n "$zip_src" ]; then unzip -q "$zip_src" -d "$source_root" || error "Zip failed."; fi
+    if [ -n "$folder_src" ]; then cp -r "$folder_src/." "$source_root" || error "Copy failed."; fi
+
+    execute_procedure "ITERATE" "$GLOBAL_RULES" "$source_root"
+    trap - EXIT
+
+    cmd_down --file "$rule_file"
+    execute_procedure "UP" "$GLOBAL_RULES" "$source_root"
+
+    add_version_record "$new_ver" "$source_root"
+    set_manif_var "LATEST_VERSION" "$new_ver"
+    set_manif_var "CURRENT_DEPLOYMENT" "$new_ver"
+}
+
+cmd_up() {
+    local rule_file="$DEFAULT_RULE_FILE"
+    local arg_rv=""; local arg_vv=""; local arg_mv=""
+    VARS=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --file) rule_file="$2"; shift 2 ;;
+            --rv) arg_rv="$2"; shift 2 ;;
+            --vv) arg_vv="$2"; shift 2 ;;
+            --mv) arg_mv="$2"; shift 2 ;;
+            --verbose) VERBOSE=true; shift ;;
+            --debug) DEBUG_MODE=true; VERBOSE=true; set -x; shift ;;
+            --v*) local key=${1#--v}; local val="$2"; VARS[$key]="$val"; shift 2 ;;
+            *) error "Unknown argument: $1" ;;
+        esac
+    done
+
+    if [ -z "$arg_rv" ]; then error "Must specify version."; fi
+    local target_ver="${arg_rv}.${arg_vv}.${arg_mv}"
+    local path=$(get_version_path "$target_ver")
+    if [ -z "$path" ] || [ ! -d "$path" ]; then error "Version $target_ver not found."; fi
+    local current=$(get_manif_var "CURRENT_DEPLOYMENT")
+    if [ "$current" == "$target_ver" ]; then log "Already on $target_ver"; exit 0; fi
+
+    log "Switching $current -> $target_ver"
+    cmd_down --file "$rule_file"
+    if [ ! -f "$rule_file" ]; then error "Rule file not found."; fi
+    GLOBAL_RULES=$(compact_rules "$rule_file")
+    load_context "$GLOBAL_RULES"
+    execute_procedure "UP" "$GLOBAL_RULES" "$path"
+    set_manif_var "CURRENT_DEPLOYMENT" "$target_ver"
+}
+
+cmd_down() {
+    local rule_file="$DEFAULT_RULE_FILE"
+    VARS=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --file) rule_file="$2"; shift 2 ;;
+            --v*) local key=${1#--v}; local val="$2"; VARS[$key]="$val"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local current=$(get_manif_var "CURRENT_DEPLOYMENT")
+    if [ "$current" == "NONE" ] || [ -z "$current" ]; then return; fi
+    local path=$(get_version_path "$current")
+    if [ ! -d "$path" ]; then set_manif_var "CURRENT_DEPLOYMENT" "NONE"; return; fi
+    
+    if [ ! -f "$rule_file" ]; then error "Rule file not found."; fi
+    GLOBAL_RULES=$(compact_rules "$rule_file")
+    load_context "$GLOBAL_RULES"
+    execute_procedure "DOWN" "$GLOBAL_RULES" "$path"
+    set_manif_var "CURRENT_DEPLOYMENT" "NONE"
+}
+
+cmd_proc() {
+    local proc_name="$1"; shift
+    local rule_file="$DEFAULT_RULE_FILE"
+    VARS=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --file) rule_file="$2"; shift 2 ;;
+            --verbose) VERBOSE=true; shift ;;
+            --debug) DEBUG_MODE=true; VERBOSE=true; set -x; shift ;;
+            --v*) local key=${1#--v}; local val="$2"; VARS[$key]="$val"; shift 2 ;;
+            *) ;;
+        esac
+    done
+
+    local current=$(get_manif_var "CURRENT_DEPLOYMENT")
+    local path="."
+    if [ "$current" != "NONE" ] && [ -n "$current" ]; then path=$(get_version_path "$current"); fi
+    if [ ! -f "$rule_file" ]; then error "Rule file not found."; fi
+    GLOBAL_RULES=$(compact_rules "$rule_file")
+    load_context "$GLOBAL_RULES"
+    execute_procedure "$proc_name" "$GLOBAL_RULES" "$path"
+}
+
+COMMAND=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+case $COMMAND in
+    init)        shift; cmd_init "$@" ;;
+    iterate)     shift; cmd_iterate "$@" ;;
+    up)          shift; cmd_up "$@" ;;
+    down)        shift; cmd_down "$@" ;;
+    proc)        shift; cmd_proc "$@" ;;
+    resolve) shift; cmd_compactrule "$@" ;;
+    current)     echo "ACTIVE: $(get_manif_var "CURRENT_DEPLOYMENT")" ;;
+    list)        shift; cmd_list "$@" ;;
+    *)           usage ;;
+esac
