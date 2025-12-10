@@ -31,7 +31,8 @@ Since `bash-scaffold` is a single script, installation is manual but instant.
 3.  Save and exit.
 
 ### Option 2: Download & Paste
-1.  Download the scaffold file from this repository:
+1.  Download the scaffold file from this repository
+2.  Make it executable and move to /usr/local/bin
 ```bash
 sudo chmod +x (your downloads folder)/scaffold
 sudo mv scaffold /usr/local/bin
