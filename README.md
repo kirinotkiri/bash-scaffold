@@ -27,14 +27,14 @@ Since `bash-scaffold` is a single script, installation is manual but instant.
     sudo chmod +x /usr/local/bin/scaffold
     sudo nano /usr/local/bin/scaffold
     ```
-2.  Paste the **v3.1** source code into the editor.
+2.  Paste the source code into the editor.
 3.  Save and exit.
 
-### Option 2: Curl (If hosted)
+### Option 2: Download & Paste
+1.  Download the scaffold file from this repository:
 ```bash
-# Assuming you host the raw script somewhere
-sudo curl -L [https://your-url.com/scaffold](https://your-url.com/scaffold) -o /usr/local/bin/scaffold
-sudo chmod +x /usr/local/bin/scaffold
+sudo chmod +x (your downloads folder)/scaffold
+sudo mv scaffold /usr/local/bin
 ````
 
 -----
