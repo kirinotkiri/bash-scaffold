@@ -219,5 +219,3 @@ This will:
 
 <!-- end list -->
 
-```
-```
